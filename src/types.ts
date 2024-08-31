@@ -1,3 +1,5 @@
+import { Address } from 'viem';
+
 export type Role = 'user' | 'assistant' | 'system';
 
 export interface Message {
@@ -5,7 +7,17 @@ export interface Message {
     content: string;
 }
 
-export type Conversation = Message[];
+export interface Conversation {
+    messages: Message[];
+    systemPrompt: string;
+}
+
+export interface Message {
+    role: MessageRole;
+    content: string;
+}
+
+export type MessageRole = 'user' | 'assistant' | 'system';
 
 // API response types
 export interface Usage {
@@ -72,3 +84,26 @@ export interface ToolCall {
 export interface ToolExecutionError extends Error {
     message: string;
 }
+
+export interface GetBalanceParameters {
+    address: Address;
+    chainId?: number;
+}
+
+export interface GetBalanceParams {
+    chain_name?: string;
+    address?: string;
+}
+
+export interface PublicClientGetBalanceParams {
+    address: Address;
+    chainId: number;
+}
+
+export interface SendEthParams {
+    to: string;
+    value: string;
+    chain_name?: string;
+}
+
+// Re-export Chain from viem if needed elsewhere

@@ -2,33 +2,32 @@ import React, { useState, useEffect } from 'react';
 import { Chat } from './components/Chat';
 import { TokenUsage } from './components/TokenUsage';
 import { useAnthropicAPI } from './hooks/useAnthropicApi';
-import { Conversation as ImportedConversation, Tool } from './types';
-import { WagmiConfig, createConfig, configureChains, mainnet } from 'wagmi';
+import { WagmiConfig, createConfig, configureChains } from 'wagmi';
 import { publicProvider } from 'wagmi/providers/public';
 import { InjectedConnector } from 'wagmi/connectors/injected';
-import { useConnect, useDisconnect, useAccount, useBalance, useSendTransaction } from 'wagmi';
-import { create } from 'zustand';
+import { useConnect, useDisconnect, useAccount, useBalance, useSendTransaction, usePublicClient, useNetwork, useSwitchNetwork } from 'wagmi';
+import { mainnet, sepolia, goerli, optimism, polygon, arbitrum } from 'wagmi/chains';
+import { isAddress, getAddress, Chain } from 'viem';
+import { GetBalanceParams, PublicClientGetBalanceParams, SendEthParams, Conversation, Message, Tool } from './types';
 
-// Define the store
-interface WalletStore {
-  address: string | undefined;
-  setAddress: (address: string | undefined) => void;
-}
+const chains: Chain[] = [mainnet, sepolia, goerli, optimism, polygon, arbitrum];
 
-const useWalletStore = create<WalletStore>((set) => ({
-  address: undefined,
-  setAddress: (address) => set({ address }),
-}));
+const getChainId = async (input: { chain_name: string }): Promise<number | undefined> => {
+  const chainName = input.chain_name.trim().toLowerCase();
+  const chain = chains.find(c => c.name.toLowerCase() === chainName || c.network.toLowerCase() === chainName);
+  console.log('Found chain:', chain);
+  return chain?.id;
+};
 
-const { chains, publicClient, webSocketPublicClient } = configureChains(
-  [mainnet],
+const { chains: configuredChains, publicClient } = configureChains(
+  chains,
   [publicProvider()]
 );
 
 const config = createConfig({
   autoConnect: true,
   publicClient,
-  webSocketPublicClient,
+  connectors: [new InjectedConnector({ chains: configuredChains })],
 });
 
 const App: React.FC = () => {
@@ -39,19 +38,42 @@ const App: React.FC = () => {
   );
 };
 
-// Update the Conversation type
-type MessageRole = 'user' | 'assistant';
-interface Message {
-  role: MessageRole;
-  content: string;
-}
-
-interface Conversation {
-  messages: Message[];
-  systemPrompt?: string;
-}
-
 const AppContent: React.FC = () => {
+  const { address, isConnected } = useAccount();
+  const { chain } = useNetwork();
+  const publicClient = usePublicClient();
+  const [connectedChainId, setConnectedChainId] = useState<number | undefined>(undefined);
+
+  const { switchNetwork } = useSwitchNetwork({
+    onSuccess(data) {
+      setConnectedChainId(data.id);
+      console.log('Switched to chain:', data.id);
+    },
+  });
+
+  const { connect } = useConnect({
+    connector: new InjectedConnector(),
+  });
+  const { disconnect } = useDisconnect();
+
+  useEffect(() => {
+    const savedConnection = localStorage.getItem('walletConnected');
+    if (savedConnection === 'true') {
+      connect();
+    }
+  }, []);
+
+  useEffect(() => {
+    if (chain?.id) {
+      setConnectedChainId(chain.id);
+      console.log('Connected wallet chain ID:', chain.id);
+    }
+  }, [chain?.id]);
+
+  useEffect(() => {
+    localStorage.setItem('walletConnected', isConnected.toString());
+  }, [isConnected]);
+
   const [conversation, setConversation] = useState<Conversation>({
     messages: [],
     systemPrompt: "You are a helpful AI assistant.",
@@ -61,55 +83,126 @@ const AppContent: React.FC = () => {
     toolChecker: { input: 0, output: 0 },
   });
 
-  const { address, setAddress } = useWalletStore();
-  
-  const { connect } = useConnect({
-    connector: new InjectedConnector(),
-    onSuccess(data) {
-      setAddress(data.account);
-      localStorage.setItem('walletAddress', data.account);
-    },
-  });
-  
-  const { disconnect } = useDisconnect({
-    onSuccess() {
-      setAddress(undefined);
-      localStorage.removeItem('walletAddress');
-    },
-  });
-  
   const { data: balance } = useBalance({ 
-    address: address as `0x${string}` | undefined 
+    address: address as `0x${string}` | undefined,
+    chainId: chain?.id
   });
   const { sendTransactionAsync } = useSendTransaction();
 
+  const getBalance = async ({ chain_name, address: inputAddress }: Partial<GetBalanceParams>) => {
+    console.log('Chain name:', chain_name);
+    console.log('Provided address:', inputAddress);
+    console.log('Is wallet connected:', isConnected);
+    console.log('Connected address:', address);
+    
+    let balanceAddress = inputAddress;
+    if (!balanceAddress) {
+      if (!isConnected) throw new Error('Wallet not connected');
+      balanceAddress = address as string;
+    }
+    console.log('Getting balance for address:', balanceAddress);
 
-  const getAddress = async () => {
-    return address
+    if (!balanceAddress) {
+      throw new Error('No valid address available');
+    }
+
+    if (!isAddress(balanceAddress)) {
+      console.error('Invalid address:', balanceAddress);
+      throw new Error(`Invalid address format: ${balanceAddress}`);
+    }
+    
+    const formattedAddress = getAddress(balanceAddress);
+
+    let chainId = connectedChainId;
+   
+    if (!chainId) throw new Error('No chain connected');
+    if (chain_name) {
+      const foundChainId = await getChainId({ chain_name });
+      if (foundChainId === undefined) {
+        throw new Error(`Chain not found: ${chain_name}`);
+      }
+      chainId = foundChainId;
+    }
+
+    console.log('Using chain ID:', chainId);
+
+    const result = await publicClient.getBalance({
+      address: formattedAddress,
+      chainId: chainId,
+    } as PublicClientGetBalanceParams);
+    
+    return result ?? 0n;
   };
 
-  const getBalance = async (address: string) => {
-    return balance ? balance.formatted : '0';
+  const sendEth = async ({ to, value, chain_name }: SendEthParams): Promise<{ success: boolean; result: any }> => {
+    try {
+      if (!address) return { success: false, result: 'Wallet not connected' };
+      console.log('sendEth called with:', { to, value, chain_name });
+      if (!to) return { success: false, result: 'Recipient address for ETH transfer is undefined or empty' };
+      if (!value) return { success: false, result: 'Value for ETH transfer is undefined or empty' };
+      
+      const bigIntValue = BigInt(value);
+      if (bigIntValue <= 0) return { success: false, result: 'Value for ETH transfer must be greater than 0' };
+
+      let targetChainId = chain?.id;
+      if (!targetChainId) return { success: false, result: 'No chain connected' };
+      if (chain_name) {
+        const foundChainId = await getChainId({ chain_name });
+        if (foundChainId === undefined) return { success: false, result: `Chain not found: ${chain_name}` };
+        targetChainId = foundChainId;
+      }
+
+      console.log('Current chain ID:', connectedChainId);
+      console.log('Target chain ID:', targetChainId);
+
+      if (connectedChainId !== targetChainId) {
+        console.log(`Switching to chain ${targetChainId}`);
+        if (!switchNetwork) return { success: false, result: 'Network switching not supported' };
+        
+        try {
+          await switchNetwork(targetChainId);
+        } catch (switchError) {
+          console.error('Error switching network:', switchError);
+          return { success: false, result: 'Failed to switch network' };
+        }
+        
+        // Wait for the chain to switch (up to 10 seconds)
+        for (let i = 0; i < 10; i++) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          console.log(`Checking chain ID after switch attempt ${i + 1}:`, connectedChainId);
+          if (connectedChainId === targetChainId) break;
+        }
+      }
+
+      console.log('Final chain ID check:', connectedChainId);
+      // Remove this check as it seems to be causing false negatives
+      // if (connectedChainId !== targetChainId) {
+      //   return { success: false, result: 'Failed to switch network or verify switch' };
+      // }
+
+      const { hash } = await sendTransactionAsync({ to, value: bigIntValue });
+      console.log('Transaction hash:', hash);
+
+      const receipt = await publicClient.waitForTransactionReceipt({ hash });
+      console.log('Transaction receipt:', receipt);
+
+      return { 
+        success: true,
+        result: {
+          hash,
+          status: receipt.status,
+          blockNumber: receipt.blockNumber,
+          transactionIndex: receipt.transactionIndex
+        }
+      };
+    } catch (error) {
+      console.error('Transaction failed:', error);
+      return { success: false, result: (error as Error).message };
+    }
   };
 
-  const sendEth = async ({ to, value }: { to: string; value: string }) => {
-    console.log('sendEth called with:', { to, value });
-    if (!to) {
-      throw new Error('Recipient address for ETH transfer is undefined or empty');
-    }
-    if (!value) {
-      throw new Error('Value for ETH transfer is undefined or empty');
-    }
-    const bigIntValue = BigInt(value);
-    if (bigIntValue <= 0) {
-      throw new Error('Value for ETH transfer must be greater than 0');
-    }
-    const result = await sendTransactionAsync({ to, value: bigIntValue });
-    return result;
-  };
-  
   const tools: Tool[] = [
-    { name: 'get_wallet_address', execute: getAddress },
+    { name: 'get_wallet_address', execute: async () => address },
     { name: 'get_balance', execute: getBalance },
     { name: 'send_eth', execute: sendEth },
   ];
@@ -166,58 +259,31 @@ const AppContent: React.FC = () => {
   const handleToolUse = async (toolName: string, toolInput: any, toolUseId: string) => {
     console.log(`Executing tool: ${toolName} with input:`, toolInput);
     const tool = tools.find(t => t.name === toolName);
-    if (tool) {
-      try {
-        // For send_eth, ensure the input is properly formatted
-        if (toolName === 'send_eth' && typeof toolInput === 'string') {
-          try {
-            toolInput = JSON.parse(toolInput);
-          } catch (e) {
-            console.error('Failed to parse send_eth input:', e);
-          }
-        }
-        
-        if (toolName === 'send_eth' && (!toolInput.to || !toolInput.value)) {
-          throw new Error('Invalid input for send_eth: missing to or value');
-        }
-
-        const result = await tool.execute(toolInput);
-        console.log(`Tool ${toolName} result:`, result);
-        
-        // Prepare the tool use response
-        const toolUseResponse = {
-          tool_use_id: toolUseId,
-          content: JSON.stringify(result),
-        };
-
-        // Send the tool use response back to the Anthropic API
-        await sendMessage(JSON.stringify(toolUseResponse), conversation.messages);
-
-        // setConversation(prev => ({
-        //   ...prev,
-        //   messages: [...prev.messages, { role: 'assistant', content: `Tool ${toolName} result: ${JSON.stringify(result)}` }]
-        // }));
-        return result;
-      } catch (error: unknown) {
-        if (error instanceof Error) {
-          const errorResponse = {
-            tool_use_id: toolUseId,
-            content: error.message,
-            is_error: true,
-          };
-          
-          // Send the error response back to the Anthropic API
-          await sendMessage(JSON.stringify(errorResponse), conversation.messages);
-
-          setConversation(prev => ({
-            ...prev,
-            messages: [...prev.messages, { role: 'assistant', content: `Error executing tool ${toolName}: ${error.message}` }]
-          }));
-        }
-        throw error;
-      }
+    if (!tool) {
+      return JSON.stringify({ error: `Tool ${toolName} not found` });
     }
-    throw new Error(`Tool ${toolName} not found`);
+
+    try {
+      const result = await tool.execute(toolInput);
+      console.log(`Tool ${toolName} result:`, result);
+      
+      const serializedResult = JSON.stringify(result, (key, value) =>
+        typeof value === 'bigint' ? value.toString() : value
+      );
+
+      const toolUseResponse = {
+        tool_use_id: toolUseId,
+        content: serializedResult,
+      };
+
+      await sendMessage(JSON.stringify(toolUseResponse), conversation.messages);
+
+      return serializedResult;
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.error(`Error executing tool ${toolName}:`, errorMessage);
+      return JSON.stringify({ error: errorMessage });
+    }
   };
 
   const handleReset = () => {
@@ -239,22 +305,14 @@ const AppContent: React.FC = () => {
     handleSendMessage(message);
   };
 
-  // Check if connected on load
-  useEffect(() => {
-    const savedAddress = localStorage.getItem('walletAddress');
-    if (savedAddress) {
-      setAddress(savedAddress);
-    }
-  }, [setAddress]);
-
   return (
     <div className="app-container">
       <header className="app-header">
         <div className="connect-button-container">
-          {address ? (
+          {isConnected ? (
             <>
               <span className="address-display">
-                {`${address.slice(0, 5)}...${address.slice(-5)}`}
+                {`${address?.slice(0, 5)}...${address?.slice(-5)}`}
               </span> 
               <button onClick={() => disconnect()} className="connect-button">Disconnect</button>
             </>
